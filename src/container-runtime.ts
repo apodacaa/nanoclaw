@@ -1,6 +1,10 @@
 /**
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
+ *
+ * Supports two runtimes:
+ * - Apple Container (macOS): `container` CLI, bridge100 networking
+ * - Docker (Linux/WSL/macOS Docker Desktop): `docker` CLI, host.docker.internal
  */
 import { execSync } from 'child_process';
 import fs from 'fs';
@@ -8,59 +12,57 @@ import os from 'os';
 
 import { logger } from './logger.js';
 
-/** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'container';
+/**
+ * The container runtime binary name.
+ * Override with CONTAINER_RUNTIME env var. Defaults to 'container' on macOS
+ * (Apple Container) and 'docker' everywhere else.
+ */
+export const CONTAINER_RUNTIME_BIN: 'container' | 'docker' =
+  (process.env.CONTAINER_RUNTIME as 'container' | 'docker') ||
+  (os.platform() === 'darwin' ? 'container' : 'docker');
+
+const isAppleContainer = CONTAINER_RUNTIME_BIN === 'container';
 
 /**
  * IP address containers use to reach the host machine.
- * Apple Container VMs use a bridge network (192.168.64.x); the host is at the gateway.
- * Detected from the bridge0 interface, falling back to 192.168.64.1.
+ * Apple Container: detected from bridge100/bridge0 interface.
+ * Docker: host.docker.internal (resolved via --add-host on Linux).
  */
-export const CONTAINER_HOST_GATEWAY = detectHostGateway();
+export const CONTAINER_HOST_GATEWAY = isAppleContainer
+  ? detectAppleHostGateway()
+  : 'host.docker.internal';
 
-function detectHostGateway(): string {
-  // Apple Container on macOS: containers reach the host via the bridge network gateway
+function detectAppleHostGateway(): string {
   const ifaces = os.networkInterfaces();
   const bridge = ifaces['bridge100'] || ifaces['bridge0'];
   if (bridge) {
     const ipv4 = bridge.find((a) => a.family === 'IPv4');
     if (ipv4) return ipv4.address;
   }
-  // Fallback: Apple Container's default gateway
   return '192.168.64.1';
 }
 
 /**
  * Address the credential proxy binds to.
- * Must be set via CREDENTIAL_PROXY_HOST in .env — there is no safe default
- * for Apple Container because bridge100 only exists while containers run,
- * but the proxy must start before any container.
- * The /convert-to-apple-container skill sets this during setup.
- */
-export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST;
-if (!PROXY_BIND_HOST) {
-  throw new Error(
-    'CREDENTIAL_PROXY_HOST is not set in .env. Run /convert-to-apple-container to configure.',
-  );
-}
-
-/** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
-
-/**
- * Address the credential proxy binds to.
- * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
- * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
- *   falling back to 0.0.0.0 if the interface isn't found.
+ * Apple Container: must be set via CREDENTIAL_PROXY_HOST in .env (bridge100
+ *   only exists while containers run, but proxy starts before any container).
+ * Docker Desktop (macOS/WSL): 127.0.0.1 — the VM routes host.docker.internal to loopback.
+ * Docker (Linux): bind to docker0 bridge IP so only containers can reach it.
  */
 export const PROXY_BIND_HOST =
   process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
 
 function detectProxyBindHost(): string {
+  if (isAppleContainer) {
+    logger.warn(
+      'CREDENTIAL_PROXY_HOST is not set — Apple Container needs the bridge IP. Run /convert-to-apple-container to configure.',
+    );
+    return '192.168.64.1';
+  }
+
   if (os.platform() === 'darwin') return '127.0.0.1';
 
   // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
-  // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
   if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
 
   // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
@@ -75,8 +77,8 @@ function detectProxyBindHost(): string {
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
+  // On Linux with Docker, host.docker.internal isn't built-in — add it explicitly
+  if (!isAppleContainer && os.platform() === 'linux') {
     return ['--add-host=host.docker.internal:host-gateway'];
   }
   return [];
@@ -103,6 +105,7 @@ export function stopContainer(name: string): void {
 
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
+  if (!isAppleContainer) return; // Docker daemon managed separately
   try {
     execSync(`${CONTAINER_RUNTIME_BIN} system status`, { stdio: 'pipe' });
     logger.debug('Container runtime already running');
@@ -129,10 +132,10 @@ export function ensureContainerRuntimeRunning(): void {
         '║  Agents cannot run without a container runtime. To fix:        ║',
       );
       console.error(
-        '║  1. Ensure Apple Container is installed                        ║',
+        `║  1. Ensure ${isAppleContainer ? 'Apple Container' : 'Docker'} is installed${' '.repeat(isAppleContainer ? 16 : 23)}║`,
       );
       console.error(
-        '║  2. Run: container system start                                ║',
+        `║  2. Run: ${CONTAINER_RUNTIME_BIN} ${isAppleContainer ? 'system start' : 'info'}${' '.repeat(isAppleContainer ? 24 : 33)}║`,
       );
       console.error(
         '║  3. Restart NanoClaw                                           ║',
@@ -148,30 +151,55 @@ export function ensureContainerRuntimeRunning(): void {
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] =
-      JSON.parse(output || '[]');
-    const orphans = containers
-      .filter(
-        (c) =>
-          c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
-      )
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        stopContainer(name);
-      } catch {
-        /* already stopped */
+    if (isAppleContainer) {
+      const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      });
+      const containers: { status: string; configuration: { id: string } }[] =
+        JSON.parse(output || '[]');
+      const orphans = containers
+        .filter(
+          (c) =>
+            c.status === 'running' &&
+            c.configuration.id.startsWith('nanoclaw-'),
+        )
+        .map((c) => c.configuration.id);
+      for (const name of orphans) {
+        try {
+          stopContainer(name);
+        } catch {
+          /* already stopped */
+        }
       }
-    }
-    if (orphans.length > 0) {
-      logger.info(
-        { count: orphans.length, names: orphans },
-        'Stopped orphaned containers',
+      if (orphans.length > 0) {
+        logger.info(
+          { count: orphans.length, names: orphans },
+          'Stopped orphaned containers',
+        );
+      }
+    } else {
+      const output = execSync(
+        `${CONTAINER_RUNTIME_BIN} ps --filter "name=nanoclaw-" --format "{{.Names}}"`,
+        { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
       );
+      const orphans = output
+        .trim()
+        .split('\n')
+        .filter((n) => n);
+      for (const name of orphans) {
+        try {
+          stopContainer(name);
+        } catch {
+          /* already stopped */
+        }
+      }
+      if (orphans.length > 0) {
+        logger.info(
+          { count: orphans.length, names: orphans },
+          'Stopped orphaned containers',
+        );
+      }
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up orphaned containers');
