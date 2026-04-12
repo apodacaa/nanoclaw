@@ -239,6 +239,16 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+  // Ensure all writable mounts are accessible by the container user (node, UID 1000).
+  // The host runs as root but containers run as non-root, so directories created by
+  // the host default to root-only write. Without this, the container silently fails
+  // to write/delete files (e.g. IPC input, session data, conversation archives).
+  for (const mount of mounts) {
+    if (!mount.readonly && fs.existsSync(mount.hostPath) && fs.statSync(mount.hostPath).isDirectory()) {
+      fs.chmodSync(mount.hostPath, 0o777);
+    }
+  }
+
   return mounts;
 }
 
