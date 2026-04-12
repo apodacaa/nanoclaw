@@ -244,7 +244,11 @@ function buildVolumeMounts(
   // the host default to root-only write. Without this, the container silently fails
   // to write/delete files (e.g. IPC input, session data, conversation archives).
   for (const mount of mounts) {
-    if (!mount.readonly && fs.existsSync(mount.hostPath) && fs.statSync(mount.hostPath).isDirectory()) {
+    if (
+      !mount.readonly &&
+      fs.existsSync(mount.hostPath) &&
+      fs.statSync(mount.hostPath).isDirectory()
+    ) {
       fs.chmodSync(mount.hostPath, 0o777);
     }
   }
