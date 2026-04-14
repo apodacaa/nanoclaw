@@ -5,7 +5,12 @@ import { ASSISTANT_NAME, DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import { Channel, OnChatMetadata, OnInboundMessage, RegisteredGroup } from '../types.js';
+import {
+  Channel,
+  OnChatMetadata,
+  OnInboundMessage,
+  RegisteredGroup,
+} from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Types matching the Matrix Client-Server API responses
@@ -176,11 +181,14 @@ export class MatrixChannel implements Channel {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: this.botUsername, password: this.botPassword }),
+          body: JSON.stringify({
+            username: this.botUsername,
+            password: this.botPassword,
+          }),
           signal: this.abortController?.signal,
         },
       );
-      const probe = await probeResp.json() as any;
+      const probe = (await probeResp.json()) as any;
 
       if (probe.session) {
         // Step 2: complete with m.login.dummy
