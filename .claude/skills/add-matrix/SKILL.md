@@ -46,7 +46,15 @@ The bot needs its own Matrix account. Two paths:
 ```bash
 curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/register \
   -H 'Content-Type: application/json' \
-  -d '{"username":"nanoclaw","password":"<generate-a-strong-password>"}' | jq .
+  -d '{"username":"nanoclaw","password":"<generate-a-strong-password>"}'
+```
+
+If the server returns a UIAA flow with a `session`, complete it:
+
+```bash
+curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"nanoclaw","password":"<password>","auth":{"type":"m.login.dummy","session":"<session-from-above>"}}'
 ```
 
 If registration succeeds, note the `user_id` and `access_token` in the response.
@@ -56,7 +64,7 @@ If registration succeeds, note the `user_id` and `access_token` in the response.
 ```bash
 curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/login \
   -H 'Content-Type: application/json' \
-  -d '{"type":"m.login.password","user":"nanoclaw","password":"<password>"}' | jq .
+  -d '{"type":"m.login.password","user":"nanoclaw","password":"<password>"}'
 ```
 
 ### Configure environment
@@ -101,31 +109,54 @@ systemctl --user restart nanoclaw
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw
 ```
 
-## Phase 4: Registration
+## Phase 4: Create and Register Room
 
-### Create a room and get the Room ID
+### Get bot access token
 
-From Element (or curl):
+Log in as the bot to get an access token for room creation:
 
 ```bash
-curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/createRoom \
-  -H "Authorization: Bearer <access_token>" \
+ACCESS_TOKEN=$(curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/login \
   -H 'Content-Type: application/json' \
-  -d '{"name":"NanoClaw Main"}' | jq -r .room_id
+  -d '{"type":"m.login.password","user":"<bot-username>","password":"<bot-password>"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+echo "Token: $ACCESS_TOKEN"
 ```
 
-The room ID looks like `!abc123def:yourdomain.com`. The NanoClaw JID is `mx:!abc123def:yourdomain.com`.
+### Ask the user
 
-Alternatively, create a room in Element and invite the bot — it will auto-join. Then find the room ID in Element's room settings (advanced).
+AskUserQuestion: What should the room be called? (default: "NanoClaw Main")
+
+AskUserQuestion: What is your Matrix username? (e.g., `alice` — needed to invite you to the room)
+
+### Create the room and invite the user
+
+```bash
+ROOM_ID=$(curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/createRoom \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"<room-name>","invite":["@<username>:<homeserver-domain>"]}' | python3 -c "import sys,json; print(json.load(sys.stdin)['room_id'])")
+echo "Room ID: $ROOM_ID"
+```
+
+The `invite` field in `createRoom` is best-effort — some homeservers silently ignore it. Always follow up with an explicit invite:
+
+```bash
+curl -s -X POST <HOMESERVER_URL>/_matrix/client/v3/rooms/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$ROOM_ID'))")/invite \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"@<username>:<homeserver-domain>"}'
+```
+
+Tell the user to check Element for the invite.
 
 ### Register the room in NanoClaw
 
-For a main room (responds to all messages):
+For the main room (responds to all messages):
 
 ```bash
 npx tsx setup/index.ts --step register -- \
-  --jid "mx:<room-id>" \
-  --name "Matrix Main" \
+  --jid "mx:$ROOM_ID" \
+  --name "<room-name>" \
   --folder "matrix_main" \
   --trigger "@${ASSISTANT_NAME}" \
   --channel matrix \
@@ -142,17 +173,6 @@ npx tsx setup/index.ts --step register -- \
   --folder "matrix_<name>" \
   --trigger "@${ASSISTANT_NAME}" \
   --channel matrix
-```
-
-For rooms owned by bot 2 (or bot N), use the corresponding channel name:
-
-```bash
-npx tsx setup/index.ts --step register -- \
-  --jid "mx:<room-id>" \
-  --name "<room-name>" \
-  --folder "matrix_<name>" \
-  --trigger "@${ASSISTANT_NAME}" \
-  --channel matrix-2
 ```
 
 ## Phase 5: Verify

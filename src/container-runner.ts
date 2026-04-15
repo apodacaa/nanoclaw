@@ -58,6 +58,19 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+/** Recursively chown a directory and its immediate children. */
+function chownRecursiveSync(dir: string, uid: number, gid: number): void {
+  fs.chownSync(dir, uid, gid);
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      chownRecursiveSync(full, uid, gid);
+    } else {
+      fs.chownSync(full, uid, gid);
+    }
+  }
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -231,17 +244,30 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
-  // Ensure all writable mounts are accessible by the container user (node, UID 1000).
-  // The host runs as root but containers run as non-root, so directories created by
-  // the host default to root-only write. Without this, the container silently fails
-  // to write/delete files (e.g. IPC input, session data, conversation archives).
+  // Ensure all writable mounts are accessible by the container user.
+  // The host often runs as root but containers run as non-root, so directories
+  // created by the host default to root-only write. Use chown to the container
+  // UID instead of chmod 777 to avoid making directories world-writable.
+  const hostUid = process.getuid?.();
+  const hostGid = process.getgid?.();
+  const containerUid =
+    hostUid != null && hostUid !== 0 && hostUid !== 1000 ? hostUid : 1000;
+  const containerGid =
+    hostGid != null && hostUid !== 0 && hostUid !== 1000 ? hostGid : 1000;
+
   for (const mount of mounts) {
     if (
       !mount.readonly &&
       fs.existsSync(mount.hostPath) &&
       fs.statSync(mount.hostPath).isDirectory()
     ) {
-      fs.chmodSync(mount.hostPath, 0o777);
+      try {
+        chownRecursiveSync(mount.hostPath, containerUid, containerGid);
+      } catch {
+        // chown may fail if host process lacks CAP_CHOWN (non-root).
+        // In that case the host user IS the container user (via --user flag),
+        // so default directory permissions (owner-writable) already suffice.
+      }
     }
   }
 
