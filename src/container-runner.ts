@@ -284,6 +284,11 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Signal to Claude Code CLI that it is running in an isolated sandbox.
+  // Without this, newer Claude Code versions refuse --dangerously-skip-permissions
+  // when uid=0, which is the default inside the container.
+  args.push('-e', 'IS_SANDBOX=1');
+
   // Forward Ollama admin tools flag if enabled
   if (OLLAMA_ADMIN_TOOLS) {
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
