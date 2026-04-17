@@ -238,7 +238,12 @@ function buildVolumeMounts(
   // Caldav-cli shared state — populated by the host's caldav-sync.timer,
   // read/written by the container agent. Mounted at a stable container path
   // so per-group configs can point at it without knowing host layout.
-  const caldavStateDir = path.join(os.homedir(), '.local', 'share', 'caldav-cli');
+  const caldavStateDir = path.join(
+    os.homedir(),
+    '.local',
+    'share',
+    'caldav-cli',
+  );
   if (fs.existsSync(caldavStateDir)) {
     mounts.push({
       hostPath: caldavStateDir,
