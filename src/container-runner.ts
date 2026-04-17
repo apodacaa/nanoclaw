@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -233,6 +234,18 @@ function buildVolumeMounts(
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Caldav-cli shared state — populated by the host's caldav-sync.timer,
+  // read/written by the container agent. Mounted at a stable container path
+  // so per-group configs can point at it without knowing host layout.
+  const caldavStateDir = path.join(os.homedir(), '.local', 'share', 'caldav-cli');
+  if (fs.existsSync(caldavStateDir)) {
+    mounts.push({
+      hostPath: caldavStateDir,
+      containerPath: '/var/lib/caldav-cli',
+      readonly: false,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {

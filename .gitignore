@@ -36,3 +36,7 @@ groups/global/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Prebuilt third-party binaries copied into container image at build time
+container/bin/*
+!container/bin/.gitkeep

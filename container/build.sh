@@ -10,6 +10,21 @@ IMAGE_NAME="nanoclaw-agent"
 TAG="${1:-latest}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-container}"
 
+# Build third-party binaries that get baked into the image.
+# caldav-cli: expected at ../../caldav-cli relative to this script (sibling of nanoclaw repo).
+CALDAV_SRC="$SCRIPT_DIR/../../caldav-cli"
+CALDAV_TARGET="x86_64-unknown-linux-musl"
+if [ -d "$CALDAV_SRC" ]; then
+  echo "Building caldav-cli (target: $CALDAV_TARGET) from $CALDAV_SRC..."
+  # Static musl build — portable across any Linux glibc version in the runtime image.
+  # Requires: rustup target add x86_64-unknown-linux-musl && apt install musl-tools
+  (cd "$CALDAV_SRC" && cargo build --release --target "$CALDAV_TARGET")
+  cp "$CALDAV_SRC/target/$CALDAV_TARGET/release/caldav-cli" "$SCRIPT_DIR/bin/caldav-cli"
+  echo "  -> $SCRIPT_DIR/bin/caldav-cli ($(du -h "$SCRIPT_DIR/bin/caldav-cli" | cut -f1))"
+else
+  echo "caldav-cli source not found at $CALDAV_SRC — skipping (image will lack caldav-cli)"
+fi
+
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 

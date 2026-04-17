@@ -35,6 +35,14 @@ RUN npm install -g agent-browser @anthropic-ai/claude-code
 # Create app directory
 WORKDIR /app
 
+# Prebuilt third-party binaries (see container/build.sh).
+# caldav-cli: Rust CLI for CalDAV (calendar) access. Built on host.
+# Copy is layered last among static assets to keep cache hits on source changes.
+COPY bin/ /tmp/nanoclaw-bin/
+RUN if [ -f /tmp/nanoclaw-bin/caldav-cli ]; then \
+      install -m 0755 /tmp/nanoclaw-bin/caldav-cli /usr/local/bin/caldav-cli; \
+    fi && rm -rf /tmp/nanoclaw-bin
+
 # Copy package files first for better caching
 COPY agent-runner/package*.json ./
 
