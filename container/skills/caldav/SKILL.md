@@ -37,20 +37,20 @@ The host timer keeps the DB current. Just read:
 caldav-cli -c /workspace/group/.caldav/config.toml --json event list --from 2026-04-16 --to 2026-04-23
 ```
 
-Treat the DB as ~5 min stale at worst. If the user explicitly says "check right now" or needs up-to-the-second accuracy, you can force a pull with `sync run`, but don't do it reflexively.
+Treat the DB as ~5 min stale at worst. If the user says "check right now", tell them you're on a 5-min pull cadence — forcing a pull from inside the container isn't available (no credentials here; see "Write pattern" for how pushes work).
 
-## Write pattern — push after mutating
+## Write pattern — push via host IPC
 
-After `event create`/`update`/`delete`, call `sync run` once to push your change to the server immediately. Without this, the change sits locally until the next timer tick.
+The container config has no server credentials, so `sync run` inside the container will fail by design. Instead, after `event create`/`update`/`delete`, drop an IPC sentinel — the host runs `sync run` with its real config:
 
 ```bash
-# Create an event, then push
+# Create an event locally, then ask the host to push
 caldav-cli -c ... --json event create --calendar "Work" --summary "Lunch" \
   --start 2026-04-20T12:30:00 --end 2026-04-20T13:30:00
-caldav-cli -c ... --json sync run
+echo '{"type":"caldav_push"}' > /workspace/ipc/tasks/caldav_$(date +%s%N).json
 ```
 
-Batch multiple writes before the final `sync run` when you can.
+Batch multiple writes before the final sentinel — one push picks up everything pending. If you forget the sentinel, the change still syncs on the host timer's next tick (~5 min).
 
 ## Commands
 
@@ -97,11 +97,12 @@ caldav-cli -c ... --json event resolve <event_id> --keep-local   # or --keep-ser
 
 ```bash
 caldav-cli -c ... --json sync status    # last sync, pending changes, daemon state
-caldav-cli -c ... --json config show    # config without password
-caldav-cli -c ... --json config test    # verify server reachability
+caldav-cli -c ... --json config show    # config (no real password — host owns creds)
 ```
 
-If `sync status` shows `last_sync_at` more than ~10 minutes old, the host timer has failed — report that to the user rather than papering over it with `sync run`. Note `sync status` only reflects the Mailbox.org sync; the ChronosHub ICS sync runs via a separate host timer (`chronoshub-ics-sync.timer`, 15 min cadence) and isn't visible here.
+If `sync status` shows `last_sync_at` more than ~10 minutes old, the host timer has failed — report that to the user. Drop the `caldav_push` IPC sentinel to trigger an immediate host-side sync if needed. Note `sync status` only reflects the Mailbox.org sync; the ChronosHub ICS sync runs via a separate host timer (`chronoshub-ics-sync.timer`, 15 min cadence) and isn't visible here.
+
+Don't run `config test` inside the container — it needs real credentials and will fail.
 
 ## Date handling
 
@@ -121,12 +122,12 @@ caldav-cli -c ... --json event list --from 2026-04-20T09:00:00 --to 2026-04-20T1
 
 - `No profile specified` → check `config show`; default profile may be missing.
 - `Failed to read config file` → config.toml path is wrong. Should always be `/workspace/group/.caldav/config.toml`.
-- `Failed to connect` (only relevant to `sync run`) → `config test` for the full handshake error.
+- Auth error / 401 on `sync run` → expected: the container has no real credentials. Drop the `caldav_push` sentinel instead.
 - Conflict on write → `event conflicts`, resolve explicitly.
 
 ## Don't
 
 - Don't run `sync start` — the host timer owns syncing.
-- Don't run `sync run` before reads. The timer handles it.
-- Don't modify `config.toml` unless asked. Password is cleartext there.
+- Don't run `sync run` inside the container — it will fail (no credentials). Drop the IPC sentinel instead (see "Write pattern").
+- Don't try to edit `config.toml` — the mount is read-only and contains no real credentials anyway.
 - Don't invent event IDs. Get them from `list` or `get`.

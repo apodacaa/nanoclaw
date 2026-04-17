@@ -252,6 +252,20 @@ function buildVolumeMounts(
     });
   }
 
+  // Shadow the group's .caldav/ directory with a read-only mount so the agent
+  // cannot rewrite config.toml (e.g. inject a password it obtained elsewhere).
+  // The group folder itself is mounted read-write above; this more-specific
+  // mount overrides it just for .caldav/. Directory mount (not file) for
+  // Apple Container compatibility — Apple Container doesn't support file mounts.
+  const groupCaldavDir = path.join(groupDir, '.caldav');
+  if (fs.existsSync(groupCaldavDir)) {
+    mounts.push({
+      hostPath: groupCaldavDir,
+      containerPath: '/workspace/group/.caldav',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -332,6 +346,12 @@ function buildContainerArgs(
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
+  // Session store is mounted at /home/node/.claude. Force HOME to match so
+  // the SDK persists session .jsonl files to the mount instead of the root
+  // user's ephemeral home — otherwise every next-turn resume fails with
+  // "No conversation found with session ID".
+  args.push('-e', 'HOME=/home/node');
+
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
   // or when getuid is unavailable (native Windows without WSL).
@@ -346,7 +366,6 @@ function buildContainerArgs(
     } else {
       args.push('--user', `${hostUid}:${hostGid}`);
     }
-    args.push('-e', 'HOME=/home/node');
   }
 
   for (const mount of mounts) {

@@ -1,3 +1,4 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -397,6 +398,40 @@ export async function processTaskIpc(
           'Task updated via IPC',
         );
         deps.onTasksChanged();
+      }
+      break;
+
+    case 'caldav_push':
+      // Only main can trigger a server push — the host config holds the real
+      // CalDAV credentials, not the container. See scripts/caldav-push.sh.
+      if (isMain) {
+        const scriptPath = path.resolve(
+          process.cwd(),
+          'scripts/caldav-push.sh',
+        );
+        execFile(
+          '/bin/bash',
+          [scriptPath],
+          { timeout: 30_000 },
+          (err, stdout, stderr) => {
+            if (err) {
+              logger.error(
+                { err, stderr: stderr?.trim() },
+                'caldav-push failed',
+              );
+            } else {
+              logger.info(
+                { sourceGroup, stdout: stdout.trim() },
+                'caldav-push ok',
+              );
+            }
+          },
+        );
+      } else {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized caldav_push attempt blocked',
+        );
       }
       break;
 
