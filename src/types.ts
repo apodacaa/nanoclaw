@@ -30,6 +30,23 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  // Override the host directory mounted at /var/lib/caldav-cli. Defaults to
+  // ~/.local/share/caldav-cli (the host's primary caldav-sync.timer state).
+  // Set this to isolate a group on its own caldav account + DB.
+  caldavStateDir?: string;
+  // Override the host directory mounted at /var/lib/imap-cli. Defaults to
+  // ~/.local/share/imap-cli. Only takes effect if `imap` is also enabled
+  // (or the group is main).
+  imapStateDir?: string;
+  // Opt non-main groups into the imap mount. Main groups always get imap.
+  imap?: boolean;
+  // Mount /workspace/global (read-only for non-main, read-write for main).
+  // Default: true. Set false to keep a group fully isolated from shared
+  // household/global memory.
+  global?: boolean;
+  // Override the container's TZ env. Default: process-level TIMEZONE config.
+  // Use IANA names (e.g. "America/Los_Angeles", "Europe/Copenhagen").
+  timezone?: string;
 }
 
 export interface RegisteredGroup {
@@ -95,6 +112,9 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: send an audio file. Channels that don't implement it fall back
+  // to a default in the registry that throws.
+  sendAudio?(jid: string, filePath: string, caption?: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

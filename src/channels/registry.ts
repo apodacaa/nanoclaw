@@ -26,3 +26,20 @@ export function getChannelFactory(name: string): ChannelFactory | undefined {
 export function getRegisteredChannelNames(): string[] {
   return [...registry.keys()];
 }
+
+/**
+ * Invoke a channel's sendAudio if implemented, otherwise throw.
+ * Centralises the "audio not supported" error so each channel doesn't need
+ * its own stub.
+ */
+export async function sendAudioViaChannel(
+  channel: Channel,
+  jid: string,
+  filePath: string,
+  caption?: string,
+): Promise<void> {
+  if (!channel.sendAudio) {
+    throw new Error(`Audio not supported by channel "${channel.name}"`);
+  }
+  await channel.sendAudio(jid, filePath, caption);
+}

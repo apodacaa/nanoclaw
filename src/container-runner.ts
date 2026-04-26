@@ -59,6 +59,55 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+/** Expand a leading `~` to the host home directory. */
+function resolveHostPath(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/**
+ * Validate a per-group caldav/imap state-dir override.
+ *
+ * The path must:
+ *   - resolve to an absolute, real path under ~/.local/share/
+ *   - have a basename starting with the expected CLI prefix
+ *     (caldav-cli or imap-cli, optionally followed by `-<suffix>`)
+ *
+ * Returns the resolved absolute path on success, or null with a warning
+ * logged on rejection. This is defence-in-depth: only the main agent's MCP
+ * `register_group` tool can write `containerConfig`, but constraining the
+ * shape here prevents a compromised main agent from mounting arbitrary host
+ * directories at /var/lib/caldav-cli or /var/lib/imap-cli.
+ */
+function validateStateDir(
+  raw: string,
+  cliPrefix: 'caldav-cli' | 'imap-cli',
+  groupName: string,
+): string | null {
+  const resolved = path.resolve(resolveHostPath(raw));
+  const allowedRoot = path.join(os.homedir(), '.local', 'share');
+  if (
+    resolved !== allowedRoot &&
+    !resolved.startsWith(allowedRoot + path.sep)
+  ) {
+    logger.warn(
+      { group: groupName, path: resolved, cliPrefix },
+      'Rejecting state-dir override outside ~/.local/share/',
+    );
+    return null;
+  }
+  const base = path.basename(resolved);
+  if (base !== cliPrefix && !base.startsWith(cliPrefix + '-')) {
+    logger.warn(
+      { group: groupName, path: resolved, cliPrefix },
+      `Rejecting state-dir override: basename must be "${cliPrefix}" or "${cliPrefix}-<suffix>"`,
+    );
+    return null;
+  }
+  return resolved;
+}
+
 /** Recursively chown a directory and its immediate children. */
 function chownRecursiveSync(dir: string, uid: number, gid: number): void {
   fs.chownSync(dir, uid, gid);
@@ -111,14 +160,19 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory — writable for main so it can update shared context
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: false,
-      });
+    // Global memory directory — writable for main so it can update shared context.
+    // Skip if the group explicitly opted out (containerConfig.global === false)
+    // — useful when a group should be isolated from shared household memory.
+    const wantGlobal = group.containerConfig?.global !== false;
+    if (wantGlobal) {
+      const globalDir = path.join(GROUPS_DIR, 'global');
+      if (fs.existsSync(globalDir)) {
+        mounts.push({
+          hostPath: globalDir,
+          containerPath: '/workspace/global',
+          readonly: false,
+        });
+      }
     }
   } else {
     // Other groups only get their own folder
@@ -128,15 +182,18 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
+    // Global memory directory (read-only for non-main).
+    // Skip if the group explicitly opted out (containerConfig.global === false).
+    const wantGlobal = group.containerConfig?.global !== false;
+    if (wantGlobal) {
+      const globalDir = path.join(GROUPS_DIR, 'global');
+      if (fs.existsSync(globalDir)) {
+        mounts.push({
+          hostPath: globalDir,
+          containerPath: '/workspace/global',
+          readonly: true,
+        });
+      }
     }
   }
 
@@ -218,13 +275,22 @@ function buildVolumeMounts(
     'agent-runner-src',
   );
   if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
+    // Compare the newest mtime across all source files on each side.
+    // Comparing only index.ts (as we used to) misses edits to sibling files
+    // like ipc-mcp-stdio.ts, leaving the cached copy silently stale.
+    const newestMtime = (dir: string): number => {
+      if (!fs.existsSync(dir)) return 0;
+      let newest = 0;
+      for (const entry of fs.readdirSync(dir)) {
+        const full = path.join(dir, entry);
+        const st = fs.statSync(full);
+        if (st.isFile() && st.mtimeMs > newest) newest = st.mtimeMs;
+      }
+      return newest;
+    };
     const needsCopy =
       !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+      newestMtime(agentRunnerSrc) > newestMtime(groupAgentRunnerDir);
     if (needsCopy) {
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
     }
@@ -238,13 +304,15 @@ function buildVolumeMounts(
   // Caldav-cli shared state — populated by the host's caldav-sync.timer,
   // read/written by the container agent. Mounted at a stable container path
   // so per-group configs can point at it without knowing host layout.
-  const caldavStateDir = path.join(
-    os.homedir(),
-    '.local',
-    'share',
-    'caldav-cli',
-  );
-  if (fs.existsSync(caldavStateDir)) {
+  // A group can override the host directory via containerConfig.caldavStateDir
+  // to isolate it on its own caldav account + DB (driven by a dedicated
+  // host-side sync timer pointed at the same directory). The override path is
+  // constrained to ~/.local/share/caldav-cli* — see validateStateDir.
+  const caldavOverride = group.containerConfig?.caldavStateDir;
+  const caldavStateDir = caldavOverride
+    ? validateStateDir(caldavOverride, 'caldav-cli', group.name)
+    : path.join(os.homedir(), '.local', 'share', 'caldav-cli');
+  if (caldavStateDir && fs.existsSync(caldavStateDir)) {
     mounts.push({
       hostPath: caldavStateDir,
       containerPath: '/var/lib/caldav-cli',
@@ -264,6 +332,49 @@ function buildVolumeMounts(
       containerPath: '/workspace/group/.caldav',
       readonly: true,
     });
+  }
+
+  // imap-cli shared state — populated by the host's imap-sync.timer, readable
+  // by the container agent. Gated to main-only by default: email is more
+  // sensitive than calendar (message bodies, attachments, credentials-adjacent
+  // auth flows), so non-main groups don't get the DB or the per-group config
+  // unless they explicitly opt in via containerConfig.imap. Non-main groups
+  // that opt in MUST also set imapStateDir so they don't accidentally see
+  // main's mailbox — main's host dir is filtered out below.
+  const imapEnabled = isMain || group.containerConfig?.imap === true;
+  if (imapEnabled) {
+    const defaultImapDir = path.join(
+      os.homedir(),
+      '.local',
+      'share',
+      'imap-cli',
+    );
+    const imapOverride = group.containerConfig?.imapStateDir;
+    const imapStateDir = imapOverride
+      ? validateStateDir(imapOverride, 'imap-cli', group.name)
+      : defaultImapDir;
+    const refusesMainDb = !isMain && imapStateDir === defaultImapDir;
+    if (refusesMainDb) {
+      logger.warn(
+        { group: group.name },
+        'Non-main group opted into imap without imapStateDir override; refusing to mount main imap DB',
+      );
+    } else if (imapStateDir && fs.existsSync(imapStateDir)) {
+      mounts.push({
+        hostPath: imapStateDir,
+        containerPath: '/var/lib/imap-cli',
+        readonly: false,
+      });
+    }
+
+    const groupImapDir = path.join(groupDir, '.imap');
+    if (fs.existsSync(groupImapDir)) {
+      mounts.push({
+        hostPath: groupImapDir,
+        containerPath: '/workspace/group/.imap',
+        readonly: true,
+      });
+    }
   }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
@@ -310,11 +421,12 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   isMain: boolean,
+  timezone: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Pass host timezone so container's local time matches the user's
-  args.push('-e', `TZ=${TIMEZONE}`);
+  // Pass timezone so container's local time matches the user's
+  args.push('-e', `TZ=${timezone}`);
 
   // Signal to Claude Code CLI that it is running in an isolated sandbox.
   // Without this, newer Claude Code versions refuse --dangerously-skip-permissions
@@ -395,7 +507,13 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
+  const timezone = group.containerConfig?.timezone || TIMEZONE;
+  const containerArgs = buildContainerArgs(
+    mounts,
+    containerName,
+    input.isMain,
+    timezone,
+  );
 
   logger.debug(
     {

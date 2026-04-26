@@ -272,7 +272,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const groupTimezone = group.containerConfig?.timezone || TIMEZONE;
+  const prompt = formatMessages(missedMessages, groupTimezone);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -564,7 +565,8 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
+          const groupTimezone = group.containerConfig?.timezone || TIMEZONE;
+          const formatted = formatMessages(messagesToSend, groupTimezone);
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
@@ -771,6 +773,14 @@ async function main(): Promise<void> {
       const text = formatOutbound(rawText, channel.name as ChannelType);
       if (!text) return Promise.resolve();
       return channel.sendMessage(jid, text);
+    },
+    sendAudio: async (jid, hostPath, caption) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendAudio) {
+        throw new Error(`Audio not supported by channel "${channel.name}"`);
+      }
+      await channel.sendAudio(jid, hostPath, caption);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

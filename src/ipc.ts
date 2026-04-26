@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
@@ -9,10 +10,11 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { AdditionalMount, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendAudio: (jid: string, hostPath: string, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -24,6 +26,61 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+}
+
+const EXTRA_MOUNT_PREFIX = '/workspace/extra/';
+
+function expandTilde(p: string): string {
+  const home = process.env.HOME || os.homedir();
+  if (p === '~') return home;
+  if (p.startsWith('~/')) return path.join(home, p.slice(2));
+  return path.resolve(p);
+}
+
+/**
+ * Translate a container-side absolute path (e.g. /workspace/extra/course/foo)
+ * into a host path, using the group's registered additionalMounts.
+ * Rejects anything outside a declared mount or that escapes via symlinks/"..".
+ */
+function resolveHostPathFromContainerPath(
+  containerPath: string,
+  mounts: AdditionalMount[] | undefined,
+): { hostPath: string; mount: AdditionalMount } | null {
+  if (!mounts || mounts.length === 0) return null;
+  if (!containerPath.startsWith(EXTRA_MOUNT_PREFIX)) return null;
+
+  const rest = containerPath.slice(EXTRA_MOUNT_PREFIX.length);
+  const firstSlash = rest.indexOf('/');
+  const mountName = firstSlash === -1 ? rest : rest.slice(0, firstSlash);
+  const subPath = firstSlash === -1 ? '' : rest.slice(firstSlash + 1);
+
+  if (!mountName || mountName.includes('..')) return null;
+
+  const mount = mounts.find(
+    (m) => (m.containerPath || path.basename(m.hostPath)) === mountName,
+  );
+  if (!mount) return null;
+
+  const hostRoot = expandTilde(mount.hostPath);
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(hostRoot);
+  } catch {
+    return null;
+  }
+
+  const joined = subPath ? path.join(realRoot, subPath) : realRoot;
+  let realFile: string;
+  try {
+    realFile = fs.realpathSync(joined);
+  } catch {
+    return null;
+  }
+
+  const relative = path.relative(realRoot, realFile);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+
+  return { hostPath: realFile, mount };
 }
 
 let ipcWatcherRunning = false;
@@ -92,6 +149,63 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
                   );
+                }
+              } else if (
+                data.type === 'audio' &&
+                data.chatJid &&
+                typeof data.path === 'string'
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                const authorized =
+                  isMain || (targetGroup && targetGroup.folder === sourceGroup);
+                if (!authorized) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC audio attempt blocked',
+                  );
+                } else if (!targetGroup) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'IPC audio: target group not registered',
+                  );
+                } else {
+                  const resolved = resolveHostPathFromContainerPath(
+                    data.path,
+                    targetGroup.containerConfig?.additionalMounts,
+                  );
+                  if (!resolved) {
+                    logger.warn(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        path: data.path,
+                      },
+                      'IPC audio rejected: path not under a registered mount',
+                    );
+                  } else {
+                    try {
+                      await deps.sendAudio(
+                        data.chatJid,
+                        resolved.hostPath,
+                        typeof data.caption === 'string'
+                          ? data.caption
+                          : undefined,
+                      );
+                      logger.info(
+                        {
+                          chatJid: data.chatJid,
+                          sourceGroup,
+                          hostPath: resolved.hostPath,
+                        },
+                        'IPC audio sent',
+                      );
+                    } catch (err) {
+                      logger.error(
+                        { err, chatJid: data.chatJid, sourceGroup },
+                        'IPC audio send failed',
+                      );
+                    }
+                  }
                 }
               }
               fs.unlinkSync(filePath);
@@ -432,6 +546,31 @@ export async function processTaskIpc(
           { sourceGroup },
           'Unauthorized caldav_push attempt blocked',
         );
+      }
+      break;
+
+    case 'imap_push':
+      // Sync IMAP + drain SMTP outbox using the host's real credentials.
+      // Mirrors caldav_push. See scripts/imap-push.sh.
+      if (isMain) {
+        const scriptPath = path.resolve(process.cwd(), 'scripts/imap-push.sh');
+        execFile(
+          '/bin/bash',
+          [scriptPath],
+          { timeout: 60_000 },
+          (err, stdout, stderr) => {
+            if (err) {
+              logger.error({ err, stderr: stderr?.trim() }, 'imap-push failed');
+            } else {
+              logger.info(
+                { sourceGroup, stdout: stdout.trim() },
+                'imap-push ok',
+              );
+            }
+          },
+        );
+      } else {
+        logger.warn({ sourceGroup }, 'Unauthorized imap_push attempt blocked');
       }
       break;
 

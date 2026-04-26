@@ -92,6 +92,7 @@ export class MatrixChannel implements Channel {
   private botUsername: string;
   private botPassword: string;
   private botIndex: number;
+  private displayName: string;
   private accessToken: string | null = null;
   private botUserId: string | null = null;
   private syncToken: string | null = null;
@@ -106,12 +107,14 @@ export class MatrixChannel implements Channel {
     username: string,
     password: string,
     botIndex: number,
+    displayName: string,
     opts: MatrixChannelOpts,
   ) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.botUsername = username;
     this.botPassword = password;
     this.botIndex = botIndex;
+    this.displayName = displayName;
     this.name = botIndex === 1 ? 'matrix' : `matrix-${botIndex}`;
     this.opts = opts;
   }
@@ -235,10 +238,30 @@ export class MatrixChannel implements Channel {
       await this.api(
         'PUT',
         `/profile/${encodeURIComponent(this.botUserId!)}/displayname`,
-        { displayname: ASSISTANT_NAME },
+        { displayname: this.displayName },
       );
     } catch (err) {
       logger.debug({ err }, 'Failed to set Matrix display name');
+    }
+
+    // Populate joinedRooms from /joined_rooms before starting the sync loop.
+    // This is required for correct routing when multiple Matrix bots are
+    // connected: routeOutbound picks the first channel whose ownsJid returns
+    // true, and ownsJid relies on joinedRooms. Without this, a bot with a
+    // persisted sync token has empty joinedRooms (since incremental syncs
+    // only include rooms with new activity), falls back to claiming every
+    // mx: jid, and ends up handing replies to the wrong bot — which then
+    // 403s because it's not a member of the target room.
+    try {
+      const resp = await this.api<{ joined_rooms: string[] }>(
+        'GET',
+        '/joined_rooms',
+      );
+      for (const roomId of resp.joined_rooms || []) {
+        this.joinedRooms.add(`mx:${roomId}`);
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Matrix /joined_rooms failed; routing may be wrong');
     }
 
     // Restore persisted sync token or do an initial sync to drain history
@@ -248,12 +271,6 @@ export class MatrixChannel implements Channel {
         const initial = await this.syncOnce(null, 0);
         this.syncToken = initial.next_batch;
         writeSyncToken(this.botIndex, this.syncToken);
-        // Populate joinedRooms from initial sync
-        if (initial.rooms?.join) {
-          for (const roomId of Object.keys(initial.rooms.join)) {
-            this.joinedRooms.add(`mx:${roomId}`);
-          }
-        }
       } catch (err) {
         logger.warn({ err }, 'Matrix initial sync failed');
       }
@@ -393,6 +410,71 @@ export class MatrixChannel implements Channel {
     }
   }
 
+  // Upload an audio file to the homeserver and post it as an m.audio message.
+  // Mime is hard-coded to audio/mpeg — we only send .mp3 course clips right now.
+  async sendAudio(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
+    const roomId = jid.replace(/^mx:/, '');
+    const filename = path.basename(filePath);
+    const body = caption || filename;
+
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(filePath);
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Matrix sendAudio: read failed');
+      throw err;
+    }
+
+    // 1. Upload bytes to the media repo.
+    const uploadUrl = `${this.baseUrl}/_matrix/media/v3/upload?filename=${encodeURIComponent(
+      filename,
+    )}`;
+    let contentUri: string;
+    try {
+      const resp = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'audio/mpeg',
+          Authorization: `Bearer ${this.accessToken}`,
+        },
+        body: new Uint8Array(bytes),
+        signal: this.abortController?.signal,
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`upload: ${resp.status} ${text}`);
+      }
+      const json = (await resp.json()) as { content_uri: string };
+      contentUri = json.content_uri;
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Matrix audio upload failed');
+      throw err;
+    }
+
+    // 2. Post m.audio message referencing the uploaded mxc:// URI.
+    const txnId = `nc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      await this.api(
+        'PUT',
+        `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`,
+        {
+          msgtype: 'm.audio',
+          body,
+          url: contentUri,
+          info: { mimetype: 'audio/mpeg', size: bytes.length },
+        },
+      );
+      logger.info({ jid, filename, size: bytes.length }, 'Matrix audio sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Matrix audio send failed');
+      throw err;
+    }
+  }
+
   // ── Interface methods ──────────────────────────────────────────────────
 
   isConnected(): boolean {
@@ -401,8 +483,6 @@ export class MatrixChannel implements Channel {
 
   ownsJid(jid: string): boolean {
     if (!jid.startsWith('mx:')) return false;
-    // Before first sync populates rooms, fall back to prefix-only
-    if (this.joinedRooms.size === 0) return true;
     return this.joinedRooms.has(jid);
   }
 
@@ -432,10 +512,15 @@ export class MatrixChannel implements Channel {
 // Self-registration — scan for numbered bot credentials
 // ---------------------------------------------------------------------------
 
-// Collect all MATRIX_BOT_N_USERNAME / MATRIX_BOT_N_PASSWORD keys we might need
+// Collect all MATRIX_BOT_N_USERNAME / MATRIX_BOT_N_PASSWORD / MATRIX_BOT_N_DISPLAY_NAME
+// keys we might need
 const allBotKeys: string[] = ['MATRIX_BASE_URL'];
 for (let i = 1; i <= 10; i++) {
-  allBotKeys.push(`MATRIX_BOT_${i}_USERNAME`, `MATRIX_BOT_${i}_PASSWORD`);
+  allBotKeys.push(
+    `MATRIX_BOT_${i}_USERNAME`,
+    `MATRIX_BOT_${i}_PASSWORD`,
+    `MATRIX_BOT_${i}_DISPLAY_NAME`,
+  );
 }
 const matrixEnv = readEnvFile(allBotKeys);
 
@@ -455,9 +540,20 @@ for (let i = 1; i <= 10; i++) {
     break;
   }
 
+  // Per-bot display name overrides ASSISTANT_NAME — needed when the same
+  // homeserver hosts multiple distinct assistants (e.g. Ivy + Ken).
+  const displayName = getEnv(`MATRIX_BOT_${i}_DISPLAY_NAME`) || ASSISTANT_NAME;
+
   const channelName = i === 1 ? 'matrix' : `matrix-${i}`;
   const idx = i; // capture for closure
   registerChannel(channelName, (opts: ChannelOpts) => {
-    return new MatrixChannel(matrixBaseUrl, username, password, idx, opts);
+    return new MatrixChannel(
+      matrixBaseUrl,
+      username,
+      password,
+      idx,
+      displayName,
+      opts,
+    );
   });
 }

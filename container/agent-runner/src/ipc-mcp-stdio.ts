@@ -68,6 +68,47 @@ server.tool(
 );
 
 server.tool(
+  'send_audio',
+  `Send an audio file from a mounted course directory to the chat. The file is uploaded by the host and posted as a native audio message (m.audio on Matrix).
+
+Use this to play authentic course clips — situation, dialogues, pronounce drills — at the moment the lesson material references them. Only paths under a read-only mount registered for this group are allowed; anything else is rejected by the host.`,
+  {
+    path: z
+      .string()
+      .describe(
+        'Absolute path inside the container under a mounted course directory, e.g. "/workspace/extra/course/_assets/dtgmedia/media/audio/1/parts/P1-L1-LPS.mp3".',
+      ),
+    caption: z
+      .string()
+      .optional()
+      .describe(
+        'Optional caption shown with the audio message (falls back to the filename).',
+      ),
+    sender: z
+      .string()
+      .optional()
+      .describe(
+        'Your role/identity name, same semantics as send_message.',
+      ),
+  },
+  async (args) => {
+    const data: Record<string, string | undefined> = {
+      type: 'audio',
+      chatJid,
+      path: args.path,
+      caption: args.caption,
+      sender: args.sender || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Audio queued.' }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 

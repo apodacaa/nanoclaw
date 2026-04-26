@@ -37,10 +37,13 @@ WORKDIR /app
 
 # Prebuilt third-party binaries (see container/build.sh).
 # caldav-cli: Rust CLI for CalDAV (calendar) access. Built on host.
-# Copy is layered last among static assets to keep cache hits on source changes.
+# imap:       Rust CLI for IMAP/SMTP (email) access. Built on host.
 COPY bin/ /tmp/nanoclaw-bin/
 RUN if [ -f /tmp/nanoclaw-bin/caldav-cli ]; then \
       install -m 0755 /tmp/nanoclaw-bin/caldav-cli /usr/local/bin/caldav-cli; \
+    fi && \
+    if [ -f /tmp/nanoclaw-bin/imap ]; then \
+      install -m 0755 /tmp/nanoclaw-bin/imap /usr/local/bin/imap; \
     fi && rm -rf /tmp/nanoclaw-bin
 
 # Copy package files first for better caching
