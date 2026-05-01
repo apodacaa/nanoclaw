@@ -323,7 +323,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       resetIdleTimer();
     }
 
-    if (result.status === 'success') {
+    // Don't mark idle on interim text — the turn is still in flight, and
+    // notifyIdle could pre-empt the container if pending tasks are queued.
+    if (result.status === 'success' && !result.interim) {
       queue.notifyIdle(chatJid);
     }
 

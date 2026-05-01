@@ -40,6 +40,12 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /**
+   * Intermediate text streamed mid-turn (e.g. an assistant text block emitted
+   * before a tool call). Hosts deliver `result` to the user but must NOT treat
+   * the agent as idle — the turn is still in flight.
+   */
+  interim?: boolean;
 }
 
 interface SessionEntry {
@@ -411,6 +417,11 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Tracks whether any assistant text was streamed in the current turn.
+  // Reset on each `result` event (turn boundary). Used to suppress the duplicate
+  // emission of result.result when the same text was already streamed via an
+  // assistant content block.
+  let textStreamedInTurn = false;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -499,8 +510,35 @@ async function runQuery(
         : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
+    if (message.type === 'assistant') {
+      if ('uuid' in message) {
+        lastAssistantUuid = (message as { uuid: string }).uuid;
+      }
+      // Forward each text content block immediately so users see prose emitted
+      // *before* a tool call. Without this, an assistant turn shaped like
+      // text → tool_use → text only delivers the final text — any leading
+      // narration (e.g. a "✓/❌" marker before a file edit) is lost.
+      const content = (
+        message as {
+          message?: { content?: Array<{ type?: string; text?: string }> };
+        }
+      ).message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (
+            block.type === 'text' &&
+            typeof block.text === 'string' &&
+            block.text.length > 0
+          ) {
+            writeOutput({
+              status: 'success',
+              result: block.text,
+              interim: true,
+            });
+            textStreamedInTurn = true;
+          }
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -529,11 +567,15 @@ async function runQuery(
       log(
         `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
       );
+      // If we already streamed assistant text via interim emissions, the SDK's
+      // final result.result is a duplicate of the last assistant block — emit
+      // null so the host still captures newSessionId without re-sending.
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: textStreamedInTurn ? null : textResult || null,
         newSessionId,
       });
+      textStreamedInTurn = false;
     }
   }
 

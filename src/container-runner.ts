@@ -51,6 +51,12 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /**
+   * Intermediate text streamed mid-turn (e.g. an assistant text block emitted
+   * before a tool call). Hosts should deliver `result` to the user but must
+   * NOT treat the agent as idle yet — the turn is still in flight.
+   */
+  interim?: boolean;
 }
 
 interface VolumeMount {
