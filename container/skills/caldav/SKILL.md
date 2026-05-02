@@ -91,18 +91,10 @@ caldav-cli -c ... --json event create --calendar "Personal" \
 
 # Meeting with attendees (repeat --attendee per person; spec is
 # "email[,role=req|opt|chair][,cn=Name]"). Organizer is required for iTIP.
-#
-# CRITICAL: --organizer must match the *calendar owner's* email. If you set an
-# organizer that doesn't match the account hosting the calendar, many CalDAV
-# servers (Open-Xchange / Mailbox.org, Apple Calendar Server, etc.) treat the
-# event as one you're merely attending and silently rewrite the ATTENDEE list
-# to just the calendar owner — wiping out everyone you tried to invite. The
-# user/wife/etc. never gets the invitation. Always confirm the owner email
-# from the group's CLAUDE.md / contacts.md / profile.md before creating.
 caldav-cli -c ... --json event create --calendar "Work" \
   --summary "Design review" --start 2026-04-22T15:00:00 --end 2026-04-22T16:00:00 \
   --tz Europe/Berlin \
-  --organizer owner@example.com \
+  --organizer aap@chronoshub.io \
   --attendee "sam@example.com,role=req,cn=Sam" \
   --attendee "kim@example.com,role=opt"
 
